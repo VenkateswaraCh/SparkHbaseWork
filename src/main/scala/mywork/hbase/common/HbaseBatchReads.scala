@@ -16,19 +16,31 @@ import org.apache.spark.sql.{Row, SparkSession}
 import scala.collection.mutable.{ArrayBuffer, ListBuffer}
 
 /**
- * Common Utilities to configure and perform CRUD operations on Hbase
- *
+ * Common Utilities to configure and perform Read operations on Hbase
  * @author VenkateswaraCh
  */
 
 object HbaseBatchReads extends HbaseEnviroment {
 
-  def hbaseMaxWritesSec: Int = 2000 // UpperLimit on transactions per second
-
-  def getNumWorkers(sc: SparkContext): Int = sc.getExecutorMemoryStatus.size
+  final val hbaseMaxWritesSec: Int = 2000 // UpperLimit on transactions per second
 
   /**
-   * Hbase Scan TimeRange from the hbase and persist on to HDFS as Parquet
+   *
+   * @param sc handle to the sparkContext
+   * @return return the number of workers assigned for this application
+   */
+  def getNumWorkers(sc: SparkContext): Int = sc.getExecutorMemoryStatus.size-1
+
+  /**
+   * Scan TimeRange from the hbase and persist on to HDFS as Parquet
+   * @param spark handle to the spark session
+   * @param hbaseTable hbase table on which the scan is being performed
+   * @param colFamily hbase column family, to parse the results returned
+   * @param maxVersions maximum number of version we would like to retrieve
+   * @param inputCols comma seperated inputcolumns to parse the Result returned by Hbase
+   * @param scanRangeStart starttimerange in milliseconds
+   * @param scanRangeEnd endtimerange in milliseconds
+   * @return parsedHbase Result to RDD of Rows
    */
   def scanFromHbaseTimeRange(spark: SparkSession, hbaseTable: String, colFamily: String, maxVersions: Int, inputCols: String, scanRangeStart: Long, scanRangeEnd: Long): RDD[Row] = {
     // configuration specific to hbase reads/scans
@@ -41,8 +53,14 @@ object HbaseBatchReads extends HbaseEnviroment {
     parseHbaseRows(hbaseRDD, colFamily, inputCols)
   }
 
-  /**
-   * Hbase Scan TimeRange from the hbase and persist on to HDFS as Parquet
+  /**+
+   * Scan from the hbase and persist on to HDFS as Parquet
+   * @param spark handle to the spark session
+   * @param hbaseTable hbase table on which the scan is being performed
+   * @param colFamily hbase column family, to parse the results returned
+   * @param maxVersions maximum number of version we would like to retrieve
+   * @param inputCols comma seperated inputcolumns to parse the Result returned by Hbase
+   * @return parsedHbase Result to RDD of Rows
    */
   def scanFromHbase(spark: SparkSession, hbaseTable: String, colFamily: String, maxVersions: Int, inputCols: String): RDD[Row] = {
     // configuration specific to hbase reads/scans
@@ -54,6 +72,16 @@ object HbaseBatchReads extends HbaseEnviroment {
     parseHbaseRows(hbaseRDD, colFamily, inputCols)
   }
 
+  /**
+   * Scan from the hbase snapshots and persist on to HDFS as Parquet
+   * @param spark handle to the spark session
+   * @param hbaseSnapshot hbase snapshot on which the scan is being performed
+   * @param colFamily hbase column family, to parse the results returned
+   * @param snapshotRestoreLocation Location on hdfs where the snapshot is restored by replaying the transaction log
+   * @param maxVersions maximum number of version we would like to retrieve
+   * @param inputCols comma seperated inputcolumns to parse the Result returned by Hbase
+   * @return parsedHbase Result to RDD of Rows
+   */
   def scanFromHbaseSnapshot(spark: SparkSession, hbaseSnapshot: String, colFamily: String, snapshotRestoreLocation: String, maxVersions: Int, inputCols: String): RDD[Row] = {
     val hconf = getHbaseSnapshotConf(spark)
     hconf.set(TableInputFormat.SCAN, Base64.encodeBytes(ProtobufUtil.toScan(new Scan().setMaxVersions(maxVersions)).toByteArray))
@@ -64,7 +92,13 @@ object HbaseBatchReads extends HbaseEnviroment {
     parseHbaseRows(hbaseRDD, colFamily, inputCols)
   }
 
-
+  /**
+   * function to parse Result returned by Hbase API and convert to Spark SQL Row
+   * @param hbaseRDD Result returned by Spark Hbase API
+   * @param colFamily hbase column family, to parse the results returned
+   * @param inputCols comma seperated inputcolumns to parse the Result returned by Hbase
+   * @return parsed Hbase Result to Spark SQL Row
+   */
   private def parseHbaseRows(hbaseRDD: RDD[(ImmutableBytesWritable, Result)], colFamily: String, inputCols: String): RDD[Row] = {
 
     val columnList: Array[String] = inputCols.split(",").map(_.trim)
@@ -89,6 +123,13 @@ object HbaseBatchReads extends HbaseEnviroment {
 
   }
 
+  /**
+   * function to parse Result returned by Hbase API and convert to Spark SQL Row
+   * @param hbaseResult RDD of Hbase Result returned by Hbase Client API
+   * @param colFamily hbase column family, to parse the results returned
+   * @param inputCols comma seperated inputcolumns to parse the Result returned by Hbase
+   * @return
+   */
   private def parseHbaseResult(hbaseResult: RDD[Result], colFamily: String, inputCols: String): RDD[Row] = {
 
     val columnList: Array[String] = inputCols.split(",").map(_.trim)
@@ -111,18 +152,28 @@ object HbaseBatchReads extends HbaseEnviroment {
     hbaseRows
   }
 
+
   /**
-   * Iterator to Iterator with a listBuffer size equal to batchSize
+   * Function to perform Hbase get using Hbase Client API, this is a Iterator to Iterator with a listBuffer size equal to batchSize
+   * @param records  Iterator of String, containing all the rowKeys
+   * @param hbaseTable Hbase table on which the get operation is being performed
+   * @param batchSize Size of batch being executed on a per task level, this is calculated based on the available CPUS and number of workers
+   * @return Return the Result object returned by the Hbase client API
    */
   private def hbaseBatchGet(records: Iterator[String], hbaseTable: String, batchSize: Int): Iterator[Result] = {
-    require(maxReqSecond.toInt <= hbaseMaxWritesSec) // Validating against threshold set forth by platform
+    require(maxReqSecond.toInt <= hbaseMaxWritesSec) // Validating against upperlimit
+    //Get the HbaseWriteConfiguration
     val conf = hbaseWriteConfig(hbaseTable)
+    //Create the connection using the configuration and get handle to the table
     val conn = ConnectionFactory.createConnection(conf)
     val table = conn.getTable(TableName.valueOf(Bytes.toBytes(hbaseTable)))
     val getList: java.util.List[Get] = new java.util.ArrayList[Get]()
     var Array(recCount, totalCount, batchCount) = Array(0, 0, 0)
     var hbaseResult: Iterator[Result] = Iterator[Result]();
 
+    /** Iterate through the input Iterator, copy the Delete object to a temporary placeholder, clear the placeholder after executing each batch
+     * Append the result returned by hbase client the iterator
+     */
     while (records.hasNext) {
       getList.add(new Get(Bytes.toBytes(records.next())));
       recCount = recCount + 1;
@@ -150,23 +201,41 @@ object HbaseBatchReads extends HbaseEnviroment {
     log.info(s"[ ** ] Input Records Size : ${totalCount} [ ** ] ")
     log.info(s"[ ** ] Total Batches Executed : ${batchCount} [ ** ] ")
     log.info(s"[ ** ] hbaseBatchGetAPI Execution Complete")
-    hbaseResult
+
+    hbaseResult // Return the result returned by the Hbase client API
   }
 
-  def hbaseBatchGet(sc: SparkContext, hbaseRDD: RDD[String], hbaseTable: String, colFamily: String, inputCols: String): RDD[Row] = {
-    require(maxReqSecond.toInt <= hbaseMaxWritesSec) // Validating against threshold set forth by platform
+  /**
+   *
+   * @param sc SparkContext handle
+   * @param rowkeysRDD RDD with the rowkeys identified for get operation
+   * @param hbaseTable hbase table on which the scan is being performed
+   * @param colFamily hbase column family, to parse the results returned
+   * @param inputCols comma seperated inputcolumns to parse the Result returned by Hbase
+   * @return
+   */
+  def hbaseBatchGet(sc: SparkContext, rowkeysRDD: RDD[String], hbaseTable: String, colFamily: String, inputCols: String): RDD[Row] = {
+    require(maxReqSecond.toInt <= hbaseMaxWritesSec) // Validating against upperlimit
     val numWorkers = getNumWorkers(sc)
+    //Size of batch being executed on a per task level, this is calculated based on the available CPUS and number of workers
     val batchSize: Int = maxReqSecond / numWorkers;
-    val hbaseResult = hbaseRDD.mapPartitions(rec => hbaseBatchGet(rec, hbaseTable, batchSize))
+    val hbaseResult = rowkeysRDD.mapPartitions(rec => hbaseBatchGet(rec, hbaseTable, batchSize))
     parseHbaseResult(hbaseResult, colFamily, inputCols)
   }
 
-  def saveDataAsParquet(spark: SparkSession, transformedRows: RDD[Row], inputCols: String, saveDir: String): Unit = {
+  /**
+   *
+   * @param spark SparkSession Handle
+   * @param parsedRows Parsed Hbase Rows
+   * @param inputCols comma seperated inputcolumns to parse the Result returned by Hbase.
+   * @param saveDir Output location on HDFS where data is being saved.
+   */
+  def saveDataAsParquet(spark: SparkSession, parsedRows: RDD[Row], inputCols: String, saveDir: String): Unit = {
     var dataSchema = new StructType()
     inputCols.split(",").foreach(colName => {
       dataSchema = dataSchema.add(colName.trim, StringType)
     })
-    val sourceData = spark.createDataFrame(transformedRows, dataSchema)
+    val sourceData = spark.createDataFrame(parsedRows, dataSchema)
     println("[ *** ] Writing HBASE snapshot to parquet in Progress")
 
     sourceData.write.mode("overwrite").save(saveDir)
