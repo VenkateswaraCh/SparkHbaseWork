@@ -6,7 +6,7 @@ This Project to summarize and publish all the work I have done on HBASE using Sp
 
 ## 1. DataSet 
 
-I used a sample retail sales dataset from Kaggle to implement this project, Please find the reference link below.
+I used a sample retail sales open dataset from Kaggle to implement this project, Please find the reference link below.
 https://www.kaggle.com/mashlyn/online-retail-ii-uci
 
 ## 2. Read From HBASE 
